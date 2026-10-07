@@ -70,6 +70,19 @@
   全程只读，不改变装配、关系与快照，不产生新版本；目标轮廓自交/面积为
   零、坐标非有限数、锚片编号非法、版本快照或锚片在该版不存在均整次拒绝
   并指出原因；无正面积缺口时返回空清单与零面积。
+- **补配候选组评估**：修复师在**任一装配版本**（当前版或历史版）中选
+  锚片、世界坐标**目标器形闭合轮廓**，并一次提交**若干候选**；每个候选
+  指定**另一连通组**的一片陶片（候选片）、**锚组内**一片陶片（锚侧
+  标记片，可为锚片自己）及两片**按序一一对应**的边缘标记（局部坐标，
+  各 ≥2 处）。系统**只取该版快照**，锚组保持该版位姿、保持候选组
+  **内部相对位姿**不变，对候选组整体施加一次平移+旋转（世界坐标最小二
+  乘拟合标记），逐候选返回逐对对应点误差、与锚组的轮廓内部重叠、目标
+  范围内**相对锚组的净新增覆盖面积**及**剩余缺口面积**。仅**每对误差
+  均 ≤ 1 mm 且无内部重叠**的候选参与排名，依次按净新增覆盖降序、最大
+  误差升序、候选片编号升序排列；**零收益照实显示**。同组候选、缺失版本
+  或陶片、无效目标轮廓或边缘标记**整次拒绝并指出问题**；单个候选的拟合
+  超差或碰撞**只标记该候选**（`eligible=false` 与原因），不影响其余结果。
+  全程只读，不改装配、关系、版本或快照，不产生新版本。
 - **不可改版本快照与历史恢复**：录入/删除碎片、采纳/撤销拼接、试拼确认、
   轮廓修订确认、锚点整体校准确认每次成功都与装配数据在**同一事务**内固化
   一条版本快照（碎片轮廓与位姿、有效及已撤销关系、连通组），快照一经写入
@@ -287,6 +300,7 @@ curl -X DELETE 'http://localhost:8000/api/fragments/5?expected_version=2'
 | `GET` | `/api/assembly/versions/{v}` | 只读查看历史版完整装配（轮廓/位姿/有效及已撤销关系/连通组） |
 | `POST` | `/api/assembly/versions/{v}/gaps` | 陶片对间隙查询：按该版快照计算每对边界最短间隙/最近点/是否重叠（只读） |
 | `POST` | `/api/assembly/versions/{v}/repair-assessment` | 补配区域评估：按组锚与世界坐标目标轮廓计算目标/已覆盖/缺口面积及逐个缺口边界（只读） |
+| `POST` | `/api/assembly/versions/{v}/repair-candidates` | 补配候选组评估：整体平移+旋转各候选所在另一连通组拟合标记，返回误差/碰撞/净新增覆盖/剩余缺口与排名（只读） |
 | `POST` | `/api/assembly/versions/{v}/restore/preview` | 恢复预览：恢复后完整装配 + 与当前版碎片/关系差异（不落库） |
 | `POST` | `/api/assembly/versions/{v}/restore/confirm` | 确认恢复（原子恢复原 ID 与状态、重算连通组，版本只 +1，留新快照） |
 | `POST` | `/api/trials/rehearse` | 有序试拼预演（不落库） |
@@ -302,11 +316,14 @@ curl -X DELETE 'http://localhost:8000/api/fragments/5?expected_version=2'
 错误约定：`400` 校验拒绝（轮廓自交 / 标记重合 / 标记不在边缘 / 标记数量
 不一致 / 遗漏有效关系 / 误差超限 / 碰撞 / 空序列 / 撤销目标非法 / 目标
 版本即当前版 / **锚点所在组不足两片** / **空陶片对列表 / 无效编号 /
-同片成对 / 重复陶片对 / 跨版本**），`404` 对象不存在（碎片、关系、
-**目标版本快照**、**锚点碎片**缺失；版本恢复时
+同片成对 / 重复陶片对 / 跨版本** / **空候选列表 / 候选与锚同组 /
+锚侧片不在锚组 / 候选标记不足、重合、数量不一致、不在该版轮廓边缘**），
+`404` 对象不存在（碎片、关系、**目标版本快照**、**锚点碎片**缺失；版本恢复时
 `detail.code=version_not_found`，校准时 `detail.code=fragment_not_found`，
 **间隙查询时 `detail.code=fragment_not_found` 并逐字段指出缺失陶片，
-补配评估时 `detail.code=anchor_not_found`（锚片在该版不存在）**），
+补配评估时 `detail.code=anchor_not_found`（锚片在该版不存在），补配候选
+评估时锚片缺失为 `anchor_not_found`、候选引用陶片缺失为
+`fragment_not_found`（逐字段指出）**），
 `409` 版本冲突或重复撤销（含恢复预览/确认、**校准预览/确认**、**导入确认**的期望版本
 过期；多实例共用库时按提交顺序判定，败方事务整体回滚、状态/版本/快照不变），
 `422` 请求体结构不合法，`503` 多实例竞争写锁等待超时（本次操作已整体取消，
@@ -1105,17 +1122,238 @@ curl -X POST http://localhost:8000/api/assembly/versions/2/repair-assessment \
 #    "message":"轮廓自交：…"}]}}
 ```
 
+## 补配候选组评估 API
+
+修复师在**任一装配版本**（当前版或任意历史版）中选**锚片**、直接在
+**世界坐标（毫米）**绘制**目标器形闭合轮廓**，并一次提交**若干候选**。
+每个候选指定三片信息与两侧标记：
+
+- `candidate_fragment_id`：**另一连通组**的一片陶片（候选片；其所在连通
+  组整体移动，孤片即单片一组）；
+- `anchor_fragment_id`：**锚组内**一片陶片（锚侧标记片，可以就是锚片
+  自己）；
+- `markers_candidate` / `markers_anchor`：两片**局部坐标**的边缘标记，
+  各 ≥2 处、**数量一致、同片不重合、位于该片在该版轮廓的边缘**，
+  **按序号一一对应**。
+
+系统**只取该版不可改快照**（当前版或历史版均可）：
+
+1. 锚组保持该版位姿不动；锚组覆盖 = 组内各片世界轮廓**先裁入目标范围、
+   再取并集**（沿用补配区域评估语义）；
+2. 对每个候选，保持其**候选组内部相对位姿**不变，以两侧标记的**世界
+   坐标**做**一次**平移+旋转的最小二乘刚体拟合（`fit_rigid`，与历史
+   拼接/校准同一套刚体配准），把同一变换复合到候选组**每一片**的该版
+   位姿上；
+3. 逐候选返回：
+   - 逐对对应点误差 `pair_errors_mm` 与 `max_error_mm`；
+   - 移动后候选组各片与**锚组**各片的轮廓内部重叠明细（允许共边/共点，
+     面积重叠才算）；候选组内部相对位姿不变，故不检查组内；
+   - `candidate_clipped_area_mm2`：候选组先裁入目标再并集的覆盖面积；
+   - `net_new_coverage_mm2`（**净新增覆盖**）：候选覆盖减去锚组覆盖
+     （与锚组重叠、超出目标的部分都不计）；
+   - `remaining_gap_area_mm2`（**剩余缺口**）：目标减去「锚组 ∪ 候选组」
+     覆盖并集后的面积。
+4. **仅** `每对误差 ≤ 1 mm` **且** `与锚组无内部重叠` 的候选参与排名
+   （`eligible=true`），依次按 **净新增覆盖降序 → 最大误差升序 →
+   候选片编号升序** 排列，结果同时给出每个候选的 `rank` 与顶层
+   `ranking`；**净新增为 0 的合格候选照实显示并照常排名**。单候选的
+   拟合超差（`error_exceeds_1mm`）或碰撞（`internal_overlap`）只标记
+   该候选（`eligible=false`、`rank=null`），其误差/面积指标仍照实给出，
+   **不影响同批其余候选**。
+
+**只读保证**：仅读取指定版本快照，不修改当前装配、位姿、关系、版本或
+历史，也不产生新版本快照。
+
+### 请求
+
+```
+POST /api/assembly/versions/{version}/repair-candidates
+```
+
+```jsonc
+{
+  "anchor_id": 1,                        // 组锚碎片 id（须存在于该版本快照）
+  "target_contour": [[0,0],[100,0],[100,60],[0,60]],   // 世界坐标闭合轮廓
+  "candidates": [
+    {
+      "candidate_fragment_id": 3,        // 另一连通组的一片（孤片亦可）
+      "anchor_fragment_id": 1,           // 锚组内一片（可为锚片自己）
+      "markers_candidate": [[0,5],[0,15]],   // 候选片局部边缘标记，按序对应
+      "markers_anchor":    [[30,5],[30,15]]  // 锚侧片局部边缘标记，按序对应
+    },
+    {
+      "candidate_fragment_id": 4,        // 另一个候选；其所在组成员一并整体移动
+      "anchor_fragment_id": 2,           // 用锚组内另一片做锚侧标记片
+      "markers_candidate": [[0,5],[0,15]],
+      "markers_anchor":    [[3,45],[0,60]]
+    }
+  ]
+}
+```
+
+### 调用示例
+
+```bash
+curl -X POST http://localhost:8000/api/assembly/versions/2/repair-candidates \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "anchor_id": 1,
+    "target_contour": [[0,0],[100,0],[100,60],[0,60]],
+    "candidates": [
+      {"candidate_fragment_id":3,"anchor_fragment_id":1,
+       "markers_candidate":[[0,5],[0,15]],
+       "markers_anchor":[[30,5],[30,15]]},
+      {"candidate_fragment_id":4,"anchor_fragment_id":1,
+       "markers_candidate":[[20,5],[20,15]],
+       "markers_anchor":[[30,5],[30,15]]}
+    ]
+  }'
+```
+
+响应（合格候选按净新增降序排名；不合格候选保留在提交序位置并标原因）：
+
+```jsonc
+{
+  "ok": true,
+  "version": 2,
+  "source": "accept",
+  "source_label": "采纳拼接",
+  "snapshot_created_at": "2026-10-07T01:20:00+00:00",
+  "current_version": 3,
+  "historical": true,
+  "anchor": {"id": 1, "name": "陶片A-左半"},
+  "group": {"id": 1, "fragment_ids": [1, 2]},   // 锚组（孤片时 group=null）
+  "independent": false,
+  "anchor_fragment_ids": [1, 2],
+  "target_contour": [[0.0,0.0],"..."],
+  "target_area_mm2": 6000.0,
+  "anchor_covered_area_mm2": 4800.0,            // 锚组在目标内的覆盖并集
+  "anchor_coverage_polygons": [ /* 外边界/内孔/面积，结构同补配评估 */ ],
+  "candidate_count": 2,
+  "eligible_count": 1,
+  "ranking": [                                  // 仅合格候选，按排名规则排序
+    {"rank": 1, "candidate_index": 1,
+     "candidate_fragment_id": 3, "candidate_name": "陶片C",
+     "anchor_fragment_id": 1,
+     "net_new_coverage_mm2": 820.0, "max_error_mm": 0.12}
+  ],
+  "candidates": [
+    {
+      "index": 1,                               // 提交序（从 1 起）
+      "candidate_fragment_id": 3, "candidate_name": "陶片C",
+      "anchor_fragment_id": 1, "anchor_side_fragment_name": "陶片A-左半",
+      "candidate_group": null,                  // 候选为孤片；成组时给整组 id 与成员
+      "moved_fragment_ids": [3],
+      "pair_count": 2,
+      "pair_errors_mm": [0.12, 0.05],
+      "max_error_mm": 0.12,
+      "all_pair_errors_within_1mm": true,
+      "overlaps": [], "has_internal_overlap": false,
+      "eligible": true,
+      "rejection_reasons": [],
+      "rank": 1,
+      "transform": {"tx_mm": 40.0, "ty_mm": 0.0, "theta_deg": 0.0},
+      "moved_poses": [                          // 候选组各片调整前/后位姿
+        {"fragment_id": 3, "name": "陶片C",
+         "before": {"x": 80.0, "y": 5.0, "theta_deg": 1.7},
+         "after":  {"x": 40.0, "y": 0.0, "theta_deg": 0.0}}
+      ],
+      "markers_world": {                        // 拟合后两侧标记世界坐标
+        "anchor": [[30.0,5.0],[30.0,15.0]],
+        "candidate": [[29.88,5.05],"..."]},
+      "target_area_mm2": 6000.0,
+      "anchor_covered_area_mm2": 4800.0,
+      "candidate_clipped_area_mm2": 820.0,      // 候选组先裁入目标再并集
+      "net_new_coverage_mm2": 820.0,            // 相对锚组的净新增
+      "remaining_gap_area_mm2": 1380.0          // 采纳本候选后的剩余缺口
+    },
+    {
+      "index": 2,
+      "candidate_fragment_id": 4, "candidate_name": "陶片D",
+      "eligible": false,
+      "rank": null,
+      "all_pair_errors_within_1mm": true,
+      "max_error_mm": 0.0,
+      "rejection_reasons": ["internal_overlap"],   // 单候选碰撞：只标记自身
+      "overlaps": [
+        {"candidate_fragment_id": 4, "anchor_fragment_id": 1,
+         "candidate_name": "陶片D", "anchor_name": "陶片A-左半",
+         "area_mm2": 210.0}],
+      "has_internal_overlap": true,
+      "net_new_coverage_mm2": 610.0,            // 指标照实给出，但不参与排名
+      "remaining_gap_area_mm2": 1390.0
+      // "transform"/"moved_poses"/"markers_world"/... 字段同样完整返回
+    }
+  ]
+}
+```
+
+- 误差超差时 `rejection_reasons` 含 `error_exceeds_1mm`
+  （`all_pair_errors_within_1mm=false`、`max_error_mm>1`）；碰撞与超差
+  可同时出现；零收益合格候选 `net_new_coverage_mm2=0.0`、`rank` 照常
+  给出（与其他零收益候选按最大误差、候选片编号决胜）。
+- 候选片所在连通组有多片时，`candidate_group.fragment_ids` 与
+  `moved_fragment_ids` 列出整组、`moved_poses` 给出每片调整前后位姿，
+  `candidate_clipped_area_mm2` 为整组裁入目标后的并集，`overlaps` 逐对
+  列出组内各片与锚组各片的重叠。
+
+### 整次拒绝（逐字段指出，不执行任何拟合）
+
+请求级问题**整次拒绝**（不会只处理部分候选）：
+
+- `400 empty_candidates`：`candidates` 为空列表；
+- `400 invalid_anchor`：锚片编号非正整数（`field=anchor_id`）；
+- `400 non_finite_coordinate`：目标轮廓或任一标记含 NaN / ±Infinity，
+  `detail.errors[]` 逐顶点/逐标记指出（字段如
+  `candidates[0].markers_candidate[2].y`）；
+- `400 invalid_target_contour`：目标轮廓顶点格式非法、不足 3 个、面积
+  为零或自交（与补配评估同一校验）；
+- `400 invalid_candidates`：`detail.errors[]` 逐字段列出全部问题——
+  `invalid_fragment_id`（编号非正整数）、`invalid_marker`（标记不是二元
+  数值坐标）、`too_few_markers`（某侧不足 2 处）、`duplicate_marker`
+  （同片标记重合）、`marker_count_mismatch`（两侧数量不一致）、
+  `marker_not_on_edge`（标记不在该片**该版**轮廓边缘，局部坐标）、
+  `same_group`（候选片与锚片属同一连通组）、
+  `anchor_fragment_not_in_anchor_group`（锚侧标记片不在锚组内）；
+- `404 anchor_not_found`：锚片在该版本快照中不存在（含「当前版存在、
+  历史版尚未录入」）；
+- `404 fragment_not_found`：候选引用的陶片在该版本快照中不存在，
+  `detail.errors[]` 逐字段指出（如 `candidates[1].candidate_fragment_id`）；
+- `404 version_not_found`：目标版本快照不存在；
+- `422`：请求体结构不合法（如 `anchor_id` 为字符串、缺少
+  `candidates` 字段）。
+
+注意与**单候选失败**的区别：拟合误差超 1 mm 或与锚组碰撞**不会**导致
+整次拒绝，该候选仍出现在 `candidates[]` 中（`eligible=false`、
+`rejection_reasons` 标明原因、指标照实给出），其余候选正常评估排名。
+
+```bash
+# 同组候选 + 标记不在边缘：一次全部指出（400，不执行任何拟合）
+curl -X POST http://localhost:8000/api/assembly/versions/2/repair-candidates \
+  -H 'Content-Type: application/json' \
+  -d '{"anchor_id":1,"target_contour":[[0,0],[100,0],[100,60],[0,60]],
+       "candidates":[
+         {"candidate_fragment_id":2,"anchor_fragment_id":1,
+          "markers_candidate":[[5,5],[6,6]],
+          "markers_anchor":[[30,5],[30,15]]}]}'
+# 400 {"detail":{"code":"invalid_candidates","errors":[
+#   {"field":"candidates[0].candidate_fragment_id","code":"same_group", ...},
+#   {"field":"candidates[0].markers_candidate[0]","code":"marker_not_on_edge", ...},
+#   {"field":"candidates[0].markers_candidate[1]","code":"marker_not_on_edge", ...}]}}
+```
+
 ## 项目结构
 
 ```
 app/
-  main.py          # FastAPI 路由、单条拼接、版本控制、试拼/修订/校准/历史恢复/间隙查询/补配评估/离线迁移端点
+  main.py          # FastAPI 路由、单条拼接、版本控制、试拼/修订/校准/历史恢复/间隙查询/补配评估/补配候选组评估/离线迁移端点
   history.py       # 历史版本：来源标签、连通组重算、碎片/关系差异演算（只读）
   portable.py      # 离线工作站迁移：JSON 包导出、整包校验、导入预览演算（只读）
   revision.py      # 轮廓修订：边缘标记校验、受影响组误差/碰撞演算（只读）
   calibration.py   # 锚点整体校准：固定锚点的组内刚体最小二乘、误差/碰撞演算（只读）
   gaps.py          # 陶片对间隙查询：版本快照上的边界最短间隙/最近点/重叠演算（只读）
   repair.py        # 补配区域评估：组锚连通组按版位姿裁剪并集、缺口孔洞拓扑演算（只读）
+  candidates.py    # 补配候选组评估：候选组整体刚体拟合标记、误差/与锚组碰撞/净新增覆盖/剩余缺口/排名演算（只读）
   trial.py         # 有序试拼：内存快照逐步推演 + 整组提交 + 位姿演算
   geometry.py      # 刚体配准（最小二乘）、轮廓/边缘标记校验、重叠检测
   database.py      # SQLite 持久化、读/写事务边界、可复用装配提交边界（版本复核/分组/递增/同版快照）、不可改版本快照、按版恢复、迁移包整包导入
@@ -1123,6 +1361,7 @@ app/
 tests/
   test_gaps.py     # 陶片对间隙查询 API 测试
   test_repair.py   # 补配区域评估 API/纯演算（孔洞、仅共点、排序、裁剪、只读、拒绝）测试
+  test_repair_candidates.py # 补配候选组评估 API/纯演算（整组刚体、误差/碰撞标记、排名、零收益、只读、整次拒绝）测试
   test_transfer.py # 离线工作站迁移（导出/预览/确认/整包拒绝/空白约束/409）测试
   test_writes_concurrency.py # 装配提交边界：回执与本次提交一致、失败/过期原子回滚、预览只读、多实例共用库按提交顺序判过期、导入不额外递增
 Dockerfile

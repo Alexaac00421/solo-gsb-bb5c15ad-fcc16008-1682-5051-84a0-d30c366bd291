@@ -59,6 +59,16 @@ SQLite 库级写锁并设置 busy_timeout，多个服务实例共用同一数据
   目标轮廓自交/面积为零、坐标非有限数、锚片编号非法、版本或锚片在该版
   不存在均整次拒绝并指出原因；无正面积缺口返回空清单与零面积
   （详见 repair.py）。
+- 补配候选组评估（/api/assembly/versions/{v}/repair-candidates）：修复师
+  在任一装配版本选锚片、世界坐标目标轮廓并一次提交若干候选（各指定另一
+  连通组的一片、锚组内一片及两片按序对应的边缘标记）；系统只取该版快照，
+  保持候选组内部相对位姿，对候选组整体平移+旋转以最小二乘拟合标记，逐
+  候选返回对应点误差、与锚组的轮廓内部重叠、目标范围内相对锚组的净新增
+  覆盖及剩余缺口面积。仅每对误差 ≤1mm 且无内部重叠的候选参与排名（净
+  新增覆盖降序、最大误差升序、候选片编号升序，零收益照实显示）；单候选
+  超差/碰撞只标记自身，不影响其余结果。同组候选、缺失版本/陶片、无效
+  目标轮廓或边缘标记整次拒绝并指出问题。只读，不改装配/关系/版本/快照
+  （详见 candidates.py）。
 - 离线工作站迁移（/api/transfer/export、/api/transfer/import/preview|
   confirm）：导出当前装配及全部不可改快照为带格式版本号的 JSON 包
   （只读）；导入先预览包内碎片、有效及已撤销关系、版本数与导入后装配
@@ -85,8 +95,9 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import calibration, gaps, geometry, history, portable, repair, revision, trial
+from . import calibration, candidates, gaps, geometry, history, portable, repair, revision, trial
 from .calibration import CalibrationError, evaluate_calibration
+from .candidates import CandidateError, evaluate_candidates, validate_candidates_static
 from .database import DB, VersionConflict
 from .portable import PackageError
 from .repair import RepairError, evaluate_repair
@@ -192,6 +203,27 @@ class RepairIn(BaseModel):
     anchor_id: int
     # 世界坐标毫米制目标器形闭合轮廓（≥3 顶点，自交/非有限坐标整次拒绝）
     target_contour: list[list[float]] = Field(min_length=3)
+
+
+class RepairCandidateIn(BaseModel):
+    # 另一连通组的一片陶片（候选片，整体平移+旋转其所在组）
+    candidate_fragment_id: int
+    # 锚组内一片陶片（锚侧标记片，可为锚片自己）
+    anchor_fragment_id: int
+    # 候选片一侧的局部坐标边缘标记（按序与锚侧一一对应）
+    markers_candidate: list[list[float]] = Field(default_factory=list)
+    # 锚侧片一侧的局部坐标边缘标记（按序与候选侧一一对应）
+    markers_anchor: list[list[float]] = Field(default_factory=list)
+
+
+class RepairCandidatesIn(BaseModel):
+    # 组锚碎片 id（必须存在于路径版本快照中）
+    anchor_id: int
+    # 世界坐标毫米制目标器形闭合轮廓（≥3 顶点，自交/非有限坐标整次拒绝）
+    target_contour: list[list[float]] = Field(min_length=3)
+    # 非空候选列表；同组候选/无效标记等请求级问题整次拒绝，单候选超差/碰撞只标记自身。
+    # 字段缺失由 pydantic 422 拒绝；显式空列表由业务校验返回 400 empty_candidates。
+    candidates: list[RepairCandidateIn]
 
 
 class TransferPreviewIn(BaseModel):
@@ -847,6 +879,47 @@ def repair_assessment(version: int, payload: RepairIn):
         return repair.build_response(
             version, source, history.source_label(source), created_at,
             current, ev)
+
+
+@app.post("/api/assembly/versions/{version}/repair-candidates")
+def repair_candidates(version: int, payload: RepairCandidatesIn):
+    """补配候选组评估：在指定版本快照上整体平移+旋转各候选所在另一连通组，
+    以锚组内一片与候选片的成对边缘标记做刚体拟合，逐候选返回对应点误差、
+    与锚组的轮廓内部重叠、目标范围内相对锚组的净新增覆盖与剩余缺口面积。
+
+    只读：只取该版快照，保持候选组内部相对位姿，不改装配/关系/版本/快照，
+    不产生新快照。仅每对误差 ≤ 1 mm 且无内部重叠的候选参与排名（净新增
+    覆盖降序 → 最大误差升序 → 候选片编号升序，零收益照实显示）；单候选
+    超差/碰撞只标记该候选，不影响其余结果。
+
+    请求级问题整次拒绝并逐字段指出：空候选 / 无效编号 / 标记不足、重合、
+    数量不一致 / 非有限坐标 / 标记不在该版轮廓边缘 / 候选与锚同组 /
+    锚侧片不在锚组 → 400；版本快照缺失 → 404 version_not_found；锚片在
+    该版不存在 → 404 anchor_not_found；候选陶片在该版不存在 →
+    404 fragment_not_found。
+    """
+    d = get_db()
+    with d.read_tx():
+        try:
+            repair.validate_anchor(payload.anchor_id)
+            target_points = repair.validate_target(payload.target_contour)
+            validate_candidates_static(payload.candidates)
+        except RepairError as e:
+            raise HTTPException(e.status, e.detail())
+        except CandidateError as e:
+            raise HTTPException(e.status, e.detail())
+        source, created_at, snap = _load_snapshot(d, version)
+        try:
+            ev = evaluate_candidates(
+                snap, payload.anchor_id, target_points, payload.candidates)
+        except RepairError as e:
+            raise HTTPException(e.status, e.detail())
+        except CandidateError as e:
+            raise HTTPException(e.status, e.detail())
+        current = d.version()
+        return candidates.build_response(
+            version, source, history.source_label(source), created_at,
+            current, payload.anchor_id, target_points, ev)
 
 
 @app.post("/api/assembly/versions/{version}/restore/preview")
