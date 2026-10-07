@@ -59,6 +59,16 @@ SQLite 库级写锁并设置 busy_timeout，多个服务实例共用同一数据
   目标轮廓自交/面积为零、坐标非有限数、锚片编号非法、版本或锚片在该版
   不存在均整次拒绝并指出原因；无正面积缺口返回空清单与零面积
   （详见 repair.py）。
+- 候选补配评估（/api/assembly/versions/{v}/repair-candidates）：修复师
+  在任一装配版本选锚片与世界坐标目标轮廓，并提交若干候选（各指定另一
+  连通组的一片陶片、锚组内一片及两片按序对应的边缘标记）；系统只取该版
+  快照，保持候选组内部相对位姿，整体平移+旋转候选组以拟合标记，逐候选
+  返回对应点误差、与锚组的轮廓内部重叠、目标范围内相对锚组的净新增覆盖
+  面积及剩余缺口面积。仅每对误差 ≤1mm 且无内部重叠的候选参与排名
+  （净新增覆盖降序、最大误差升序、候选片编号升序），零收益照实显示。
+  同组候选、缺失版本/陶片、无效目标轮廓或边缘标记整次拒绝；单个候选
+  超差/碰撞只标记该候选。只读，不改装配、关系、版本与快照
+  （详见 candidates.py）。
 - 离线工作站迁移（/api/transfer/export、/api/transfer/import/preview|
   confirm）：导出当前装配及全部不可改快照为带格式版本号的 JSON 包
   （只读）；导入先预览包内碎片、有效及已撤销关系、版本数与导入后装配
@@ -85,8 +95,9 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import calibration, gaps, geometry, history, portable, repair, revision, trial
+from . import calibration, candidates, gaps, geometry, history, portable, repair, revision, trial
 from .calibration import CalibrationError, evaluate_calibration
+from .candidates import CandidateError, evaluate_candidates, get_anchor
 from .database import DB, VersionConflict
 from .portable import PackageError
 from .repair import RepairError, evaluate_repair
@@ -192,6 +203,26 @@ class RepairIn(BaseModel):
     anchor_id: int
     # 世界坐标毫米制目标器形闭合轮廓（≥3 顶点，自交/非有限坐标整次拒绝）
     target_contour: list[list[float]] = Field(min_length=3)
+
+
+class RepairCandidateIn(BaseModel):
+    # 另一连通组的候选陶片（孤片视为独立组；不得与锚片同组）
+    candidate_fragment_id: int
+    # 锚片所在连通组内的一片陶片（提供锚侧边缘标记）
+    anchor_fragment_id: int
+    # 两片按序对应的边缘标记：各自局部坐标、位于本片轮廓边缘，
+    # 每侧 ≥2 处、数量一致、同片不重合（在端点内做业务校验并整次拒绝）
+    markers_candidate: list[list[float]] = Field(default_factory=list)
+    markers_anchor: list[list[float]] = Field(default_factory=list)
+
+
+class RepairCandidatesIn(BaseModel):
+    # 组锚碎片 id（必须存在于路径版本快照中；孤片按单片评估）
+    anchor_id: int
+    # 世界坐标毫米制目标器形闭合轮廓（≥3 顶点，自交/非有限坐标整次拒绝）
+    target_contour: list[list[float]] = Field(min_length=3)
+    # 非空候选列表；空列表整次拒绝（400 empty_candidates）
+    candidates: list[RepairCandidateIn] = Field(default_factory=list)
 
 
 class TransferPreviewIn(BaseModel):
@@ -845,6 +876,53 @@ def repair_assessment(version: int, payload: RepairIn):
             raise HTTPException(e.status, e.detail())
         current = d.version()
         return repair.build_response(
+            version, source, history.source_label(source), created_at,
+            current, ev)
+
+
+@app.post("/api/assembly/versions/{version}/repair-candidates")
+def repair_candidates(version: int, payload: RepairCandidatesIn):
+    """候选补配评估：按锚片与世界坐标目标轮廓，批量评估另一连通组候选。
+
+    每个候选指定另一连通组的一片陶片、锚组内一片及两片按序对应的边缘
+    标记；系统只取该版快照，保持候选组内部相对位姿，整体平移+旋转候选组
+    以拟合标记（最小二乘刚体变换），逐候选返回：
+    - 每对对应点误差与最大误差；
+    - 拟合后候选组与锚组的轮廓内部重叠；
+    - 目标范围内相对锚组的净新增覆盖面积（零收益照实显示）；
+    - 目标范围内相对锚组的剩余缺口面积。
+
+    仅每对误差 ≤ 1 mm 且与锚组无内部重叠的候选参与排名，依次按净新增
+    覆盖降序、最大误差升序、候选片编号升序。单个候选超差/碰撞只标记该
+    候选（eligible=false + reject_reasons），不影响其余结果。
+
+    只读：不改装配、关系、版本与快照，不产生新快照。请求级问题整次拒绝：
+    空候选列表 / 无效编号 / 同组候选 / 目标轮廓无效 / 边缘标记无效 → 400；
+    版本快照缺失 → 404 version_not_found；锚片或候选陶片在该版不存在 →
+    404 anchor_not_found / fragment_not_found。
+    """
+    d = get_db()
+    with d.read_tx():
+        try:
+            repair.validate_anchor(payload.anchor_id)
+            target_points = repair.validate_target(payload.target_contour)
+            candidate_ids = candidates.validate_candidate_ids(
+                version, payload.candidates)
+        except (RepairError, CandidateError) as e:
+            raise HTTPException(e.status, e.detail())
+        source, created_at, snap = _load_snapshot(d, version)
+        try:
+            _frags, anchor = get_anchor(snap, payload.anchor_id)
+            specs = candidates.validate_candidate_markers(
+                candidate_ids,
+                {int(f["id"]): f for f in snap["fragments"]},
+                anchor, version)
+            ev = evaluate_candidates(snap, payload.anchor_id,
+                                     target_points, specs)
+        except (RepairError, CandidateError) as e:
+            raise HTTPException(e.status, e.detail())
+        current = d.version()
+        return candidates.build_response(
             version, source, history.source_label(source), created_at,
             current, ev)
 
